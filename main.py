@@ -56,6 +56,22 @@ class Cache:
         self.ttl = int(os.getenv("CACHE_TTL_HOURS", "6")) * 3600
         with sqlite3.connect(self.path) as db:
             db.execute("CREATE TABLE IF NOT EXISTS answers (key TEXT PRIMARY KEY, title TEXT, task TEXT, images TEXT, url TEXT, created INTEGER)")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(answers)")}
+            old_columns = {"cache_key", "task_text", "image_urls", "source_url", "created_at"}
+            if old_columns.issubset(columns):
+                db.execute("""CREATE TABLE answers_migrated (
+                    key TEXT PRIMARY KEY,
+                    title TEXT,
+                    task TEXT,
+                    images TEXT,
+                    url TEXT,
+                    created INTEGER
+                )""")
+                db.execute("""INSERT INTO answers_migrated (key, title, task, images, url, created)
+                    SELECT cache_key, title, task_text, image_urls, source_url, created_at
+                    FROM answers""")
+                db.execute("DROP TABLE answers")
+                db.execute("ALTER TABLE answers_migrated RENAME TO answers")
 
     def get(self, key):
         with sqlite3.connect(self.path) as db:
