@@ -1,9 +1,11 @@
 import asyncio
+import base64
 import logging
 import os
 import re
 import sqlite3
 import time
+from io import BytesIO
 from dataclasses import dataclass
 from urllib.parse import urljoin
 
@@ -12,13 +14,22 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 router = Router()
+AI_MODELS = {
+    "minimax-m3": "MiniMax M3",
+    "gemma-4-31b": "Gemma 4 31B",
+    "ag/gemini-3.7-flash-high": "Gemini 3.7 Flash High",
+}
+AI_HISTORY: dict[int, list[dict[str, str]]] = {}
 
 
 @dataclass(frozen=True)
@@ -107,6 +118,13 @@ def subjects_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=name, callback_data=f"subject:{key}")] for key, (name, _) in SUBJECTS.items()])
 
 
+def ai_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=name, callback_data=f"ai_model:{model}")]
+        for model, name in AI_MODELS.items()
+    ] + [[InlineKeyboardButton(text="Назад к предметам", callback_data="subjects")]])
+
+
 def books_keyboard(subject):
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=BOOKS[key].label, callback_data=f"book:{key}")] for key in SUBJECTS[subject][1]] + [[InlineKeyboardButton(text="Назад", callback_data="subjects")]])
 
@@ -126,6 +144,7 @@ def numbers_keyboard(key, page=0):
 class SearchState(StatesGroup):
     choosing_book = State()
     entering_number = State()
+    ai_chat = State()
 
 
 cache = Cache()
@@ -134,8 +153,34 @@ cache = Cache()
 @router.message(CommandStart())
 @router.message(Command("help"))
 async def start(message: Message, state: FSMContext):
-    await state.set_state(SearchState.choosing_book)
-    await message.answer("Выберите предмет:", reply_markup=subjects_keyboard())
+    await state.clear()
+    await message.answer("Выберите действие:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Найти решение", callback_data="subjects")],
+        [InlineKeyboardButton(text="ИИ-чат", callback_data="ai_start")],
+    ]))
+
+
+@router.callback_query(F.data == "ai_start")
+async def ai_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(SearchState.ai_chat)
+    await state.update_data(ai_model=os.getenv("ANYMODEL_MODEL", "minimax-m3"))
+    await callback.message.edit_text("Выберите ИИ-модель:", reply_markup=ai_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ai_model:"))
+async def ai_model(callback: CallbackQuery, state: FSMContext):
+    model = callback.data.split(":", 1)[1]
+    if model not in AI_MODELS:
+        await callback.answer("Кнопка устарела. Нажмите /start", show_alert=True)
+        return
+    await state.set_state(SearchState.ai_chat)
+    await state.update_data(ai_model=model)
+    await callback.message.edit_text(
+        f"Выбрана модель: {AI_MODELS[model]}\n\nНапишите вопрос. Для выхода нажмите /start.",
+        reply_markup=ai_keyboard(),
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data == "subjects")
@@ -201,6 +246,180 @@ async def task_button(callback: CallbackQuery, state: FSMContext):
 async def unknown_callback(callback: CallbackQuery):
     logging.warning("Unhandled callback data: %r", callback.data)
     await callback.answer("Кнопка устарела. Нажмите /start", show_alert=True)
+
+
+def render_latex(formula: str) -> BytesIO:
+    image = BytesIO()
+    figure = plt.figure(figsize=(0.01, 0.01), dpi=220)
+    figure.text(0, 0, f"${formula.strip()}$", fontsize=16)
+    figure.savefig(image, format="png", transparent=True, bbox_inches="tight", pad_inches=0.12)
+    plt.close(figure)
+    image.seek(0)
+    return image
+
+
+def split_latex(text: str) -> tuple[str, list[str]]:
+    formulas = []
+    pattern = re.compile(r"\$\$(.+?)\$\$|\\\[(.+?)\\\]|\$(?!\$)(.+?)(?<!\$)\$", re.DOTALL)
+
+    def replace(match):
+        formula = next(part for part in match.groups() if part is not None)
+        formulas.append(formula)
+        return "[формула отправлена изображением]"
+
+    return pattern.sub(replace, text), formulas
+
+
+async def ask_ai(user_id: int, prompt: str, model: str) -> str:
+    api_key = os.getenv("ANYMODEL_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("ИИ-провайдер не настроен")
+    history = AI_HISTORY.setdefault(user_id, [])
+    messages = [{"role": "system", "content": "Ты полезный школьный помощник. Объясняй понятно и пошагово. Математические формулы пиши в LaTeX: блочные формулы между $$ и $$, короткие формулы между $. Не используй HTML."}]
+    messages.extend(history[-10:])
+    messages.append({"role": "user", "content": prompt})
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://anymodel.org/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": model, "messages": messages, "temperature": 0.2, "max_tokens": 1800},
+                timeout=aiohttp.ClientTimeout(total=90),
+            ) as response:
+                data = await response.json(content_type=None)
+                if response.status != 200:
+                    raise RuntimeError("ИИ-провайдер вернул ошибку")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+        raise RuntimeError("ИИ-провайдер временно недоступен") from error
+    answer = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+    if not answer:
+        raise RuntimeError("ИИ не вернул ответ")
+    history.extend([{"role": "user", "content": prompt}, {"role": "assistant", "content": answer}])
+    return answer
+
+
+async def anymodel_request(payload, model: str, endpoint: str = "chat/completions"):
+    api_key = os.getenv("ANYMODEL_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("ИИ-провайдер не настроен")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"https://anymodel.org/v1/{endpoint}",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=90),
+            ) as response:
+                data = await response.json(content_type=None)
+                if response.status != 200:
+                    logging.warning("AnyModel error %s: %s", response.status, data)
+                    raise RuntimeError("ИИ-провайдер вернул ошибку")
+                return data
+    except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+        raise RuntimeError("ИИ-провайдер временно недоступен") from error
+
+
+async def transcribe_voice(file_bytes: bytes, filename: str = "voice.ogg") -> str:
+    api_key = os.getenv("ANYMODEL_API_KEY", "").strip()
+    model = os.getenv(
+        "ANYMODEL_TRANSCRIBE_MODEL",
+        "am/nemotron-3-nano-omni-30b-a3b-reasoning-stt",
+    ).strip()
+    if not api_key:
+        raise RuntimeError("ИИ-провайдер не настроен")
+    form = aiohttp.FormData()
+    form.add_field("file", file_bytes, filename=filename, content_type="audio/ogg")
+    form.add_field("model", model)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://anymodel.org/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=90),
+            ) as response:
+                data = await response.json(content_type=None)
+                if response.status != 200:
+                    logging.warning("Transcription error %s: %s", response.status, data)
+                    raise RuntimeError("не удалось распознать голос")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+        raise RuntimeError("сервис транскрибации временно недоступен") from error
+    text = data.get("text", "").strip()
+    if not text:
+        raise RuntimeError("в голосовом сообщении не найден текст")
+    return text
+
+
+async def answer_ai_content(user_id: int, content, model: str) -> str:
+    if isinstance(content, str):
+        return await ask_ai(user_id, content, model)
+    api_key = os.getenv("ANYMODEL_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("ИИ-провайдер не настроен")
+    response = await anymodel_request({
+        "model": model,
+        "messages": [{"role": "system", "content": "Ты полезный школьный помощник. Опиши и реши задание с изображения. Формулы пиши в LaTeX между $$ и $$. Не используй HTML."}, {"role": "user", "content": content}],
+        "temperature": 0.2,
+        "max_tokens": 1800,
+    })
+    answer = response.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+    if not answer:
+        raise RuntimeError("ИИ не вернул ответ")
+    return answer
+
+
+async def reply_with_ai(message: Message, state: FSMContext, content):
+    model = (await state.get_data()).get("ai_model", os.getenv("ANYMODEL_MODEL", "minimax-m3"))
+    await message.answer("ИИ готовит ответ...")
+    try:
+        answer = await answer_ai_content(message.from_user.id, content, model)
+        text, formulas = split_latex(answer)
+        for part in [text[i:i + 4000] for i in range(0, len(text), 4000)]:
+            await message.answer(part)
+        for formula in formulas:
+            try:
+                await message.answer_photo(BufferedInputFile(render_latex(formula).read(), filename="formula.png"))
+            except Exception:
+                await message.answer(f"LaTeX-формула: {formula}")
+    except RuntimeError:
+        await message.answer("Невозможно получить ответ от ИИ. Попробуйте позже.")
+
+
+@router.message(SearchState.ai_chat, F.text)
+async def ai_message(message: Message, state: FSMContext):
+    prompt = (message.text or "").strip()
+    if not prompt:
+        await message.answer("Напишите вопрос текстом.")
+        return
+    model = (await state.get_data()).get("ai_model", "minimax-m3")
+    await reply_with_ai(message, state, prompt)
+
+
+@router.message(SearchState.ai_chat, F.voice)
+async def ai_voice(message: Message, state: FSMContext, bot: Bot):
+    try:
+        telegram_file = await bot.get_file(message.voice.file_id)
+        buffer = BytesIO()
+        await bot.download_file(telegram_file.file_path, buffer)
+        prompt = await transcribe_voice(buffer.getvalue())
+        await message.answer(f"Распознано: {prompt}")
+        await reply_with_ai(message, state, prompt)
+    except RuntimeError:
+        await message.answer("Невозможно распознать голосовое сообщение. Попробуйте еще раз.")
+
+
+@router.message(SearchState.ai_chat, F.photo)
+async def ai_photo(message: Message, state: FSMContext, bot: Bot):
+    try:
+        telegram_file = await bot.get_file(message.photo[-1].file_id)
+        buffer = BytesIO()
+        await bot.download_file(telegram_file.file_path, buffer)
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        question = message.caption or "Реши задание на изображении и объясни решение пошагово."
+        content = [{"type": "text", "text": question}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}}]
+        await reply_with_ai(message, state, content)
+    except RuntimeError:
+        await message.answer("Невозможно получить информацию с фотографии. Попробуйте другое изображение.")
 
 
 @router.message(SearchState.entering_number)
