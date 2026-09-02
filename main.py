@@ -31,7 +31,14 @@ AI_MODELS = {
     "gemma-4-31b": "Gemma 4 31B",
     "ag/gemini-3.7-flash-high": "Gemini 3.7 Flash High",
 }
-VISION_MODEL = os.getenv("ANYMODEL_VISION_MODEL", "ag/gemini-3.7-flash-high")
+# Do not use the selected text model for photos. This route is published as a vision model.
+VISION_MODELS = (
+    "ag/gemini-3.7-flash-medium",
+    "am/llama-3.2-11b-vision-instruct",
+    "am/nemotron-3-nano-omni-30b-a3b-reasoning",
+    "ag/gemini-2.5-flash",
+    "ag/gemini-3.7-flash-low",
+)
 TRANSCRIBE_MODELS = (
     os.getenv("ANYMODEL_TRANSCRIBE_MODEL", "dg/whisper-large"),
     "dg/nova-3",
@@ -406,17 +413,23 @@ async def answer_ai_content(user_id: int, content, model: str) -> str:
     api_key = os.getenv("ANYMODEL_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("ИИ-провайдер не настроен")
-    response = await anymodel_request({
-        # The selected text model may not support image_url content.
-        "model": VISION_MODEL,
-        "messages": [{"role": "system", "content": "Ты полезный школьный помощник. Опиши и реши задание с изображения. Формулы пиши в LaTeX между $$ и $$. Не используй HTML."}, {"role": "user", "content": content}],
-        "temperature": 0.2,
-        "max_tokens": 1800,
-    })
-    answer = response.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-    if not answer:
-        raise RuntimeError("ИИ не вернул ответ")
-    return answer
+    last_error = None
+    for vision_model in VISION_MODELS:
+        try:
+            response = await anymodel_request({
+                "model": vision_model,
+                "messages": [{"role": "system", "content": "Ты полезный школьный помощник. Опиши и реши задание с изображения. Формулы пиши в LaTeX между $$ и $$. Не используй HTML."}, {"role": "user", "content": content}],
+                "temperature": 0.2,
+                "max_tokens": 1800,
+            })
+            answer = response.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            if answer:
+                return answer
+            last_error = "ИИ не вернул ответ"
+        except RuntimeError as error:
+            last_error = error
+            logging.warning("Vision model %s failed: %s", vision_model, error)
+    raise RuntimeError("не удалось обработать изображение") from last_error
 
 
 async def reply_with_ai(message: Message, state: FSMContext, content):
