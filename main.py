@@ -407,7 +407,8 @@ async def answer_ai_content(user_id: int, content, model: str) -> str:
     if not api_key:
         raise RuntimeError("ИИ-провайдер не настроен")
     response = await anymodel_request({
-        "model": model,
+        # The selected text model may not support image_url content.
+        "model": VISION_MODEL,
         "messages": [{"role": "system", "content": "Ты полезный школьный помощник. Опиши и реши задание с изображения. Формулы пиши в LaTeX между $$ и $$. Не используй HTML."}, {"role": "user", "content": content}],
         "temperature": 0.2,
         "max_tokens": 1800,
