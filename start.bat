@@ -28,7 +28,7 @@ echo Starting Telegram bot...
 echo Keep this window open while the bot is running.
 echo Press Ctrl+C to stop it.
 echo.
-".venv\Scripts\python.exe" -m app.bot
+".venv\Scripts\python.exe" main.py
 
 if errorlevel 1 (
     echo.
