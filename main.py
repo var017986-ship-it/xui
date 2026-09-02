@@ -145,32 +145,54 @@ async def subjects(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("subject:"))
-async def subject(callback: CallbackQuery):
-    await callback.message.edit_text("Выберите учебник:", reply_markup=books_keyboard(callback.data.split(":", 1)[1]))
+@router.callback_query(F.data == "choose_book")
+async def legacy_choose_book(callback: CallbackQuery, state: FSMContext):
+    # Keep old menus working after the bot was updated.
+    await state.set_state(SearchState.choosing_book)
+    await callback.message.edit_text("Выберите предмет:", reply_markup=subjects_keyboard())
     await callback.answer()
 
 
-@router.callback_query(SearchState.choosing_book, F.data.startswith("book:"))
+@router.callback_query(F.data.startswith("subject:"))
+async def subject(callback: CallbackQuery):
+    subject_key = callback.data.split(":", 1)[1]
+    if subject_key not in SUBJECTS:
+        await callback.answer("Это меню устарело. Нажмите /start", show_alert=True)
+        return
+    await callback.message.edit_text("Выберите учебник:", reply_markup=books_keyboard(subject_key))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("book:"))
 async def book(callback: CallbackQuery, state: FSMContext):
     key = callback.data.split(":", 1)[1]
+    if key not in BOOKS:
+        await callback.answer("Этот учебник больше недоступен. Нажмите /start", show_alert=True)
+        return
     await state.update_data(book_key=key)
     await state.set_state(SearchState.entering_number)
     await callback.message.edit_text(f"{BOOKS[key].label}\nВыберите номер задания:", reply_markup=numbers_keyboard(key))
     await callback.answer()
 
 
-@router.callback_query(SearchState.entering_number, F.data.startswith("page:"))
+@router.callback_query(F.data.startswith("page:"))
 async def page(callback: CallbackQuery):
     _, key, value = callback.data.split(":")
+    if key not in BOOKS or not value.isdigit():
+        await callback.answer("Это меню устарело. Нажмите /start", show_alert=True)
+        return
     await callback.message.edit_reply_markup(reply_markup=numbers_keyboard(key, int(value)))
     await callback.answer()
 
 
-@router.callback_query(SearchState.entering_number, F.data.startswith("task:"))
+@router.callback_query(F.data.startswith("task:"))
 async def task_button(callback: CallbackQuery, state: FSMContext):
     _, key, task = callback.data.split(":")
+    if key not in BOOKS:
+        await callback.answer("Этот учебник больше недоступен. Нажмите /start", show_alert=True)
+        return
     await state.update_data(book_key=key)
+    await state.set_state(SearchState.entering_number)
     await callback.answer()
     await process(callback.message, state, task)
 
