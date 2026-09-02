@@ -90,11 +90,11 @@ async def fetch(book, task, session):
     url = book.url(task)
     async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as response:
         if response.status != 200:
-            raise RuntimeError(f"Reshak.ru HTTP {response.status}")
+            raise RuntimeError("сайт временно недоступен")
         soup = BeautifulSoup(await response.text(), "html.parser")
     title, task_node = soup.select_one("h1.titleh1"), soup.select_one(".text_zad")
     if not title or not task_node:
-        raise RuntimeError("задание не найдено")
+        raise RuntimeError("информация по заданию не найдена")
     images = []
     for image in soup.select("[class*=pic_otvet] img"):
         source = image.get("src") or image.get("data-src")
@@ -157,7 +157,7 @@ async def legacy_choose_book(callback: CallbackQuery, state: FSMContext):
 async def subject(callback: CallbackQuery):
     subject_key = callback.data.split(":", 1)[1]
     if subject_key not in SUBJECTS:
-        await callback.answer("Это меню устарело. Нажмите /start", show_alert=True)
+        await callback.answer("Кнопка устарела. Нажмите /start", show_alert=True)
         return
     await callback.message.edit_text("Выберите учебник:", reply_markup=books_keyboard(subject_key))
     await callback.answer()
@@ -167,7 +167,7 @@ async def subject(callback: CallbackQuery):
 async def book(callback: CallbackQuery, state: FSMContext):
     key = callback.data.split(":", 1)[1]
     if key not in BOOKS:
-        await callback.answer("Этот учебник больше недоступен. Нажмите /start", show_alert=True)
+        await callback.answer("Кнопка устарела. Нажмите /start", show_alert=True)
         return
     await state.update_data(book_key=key)
     await state.set_state(SearchState.entering_number)
@@ -179,7 +179,7 @@ async def book(callback: CallbackQuery, state: FSMContext):
 async def page(callback: CallbackQuery):
     _, key, value = callback.data.split(":")
     if key not in BOOKS or not value.isdigit():
-        await callback.answer("Это меню устарело. Нажмите /start", show_alert=True)
+        await callback.answer("Кнопка устарела. Нажмите /start", show_alert=True)
         return
     await callback.message.edit_reply_markup(reply_markup=numbers_keyboard(key, int(value)))
     await callback.answer()
@@ -189,12 +189,18 @@ async def page(callback: CallbackQuery):
 async def task_button(callback: CallbackQuery, state: FSMContext):
     _, key, task = callback.data.split(":")
     if key not in BOOKS:
-        await callback.answer("Этот учебник больше недоступен. Нажмите /start", show_alert=True)
+        await callback.answer("Кнопка устарела. Нажмите /start", show_alert=True)
         return
     await state.update_data(book_key=key)
     await state.set_state(SearchState.entering_number)
     await callback.answer()
     await process(callback.message, state, task)
+
+
+@router.callback_query()
+async def unknown_callback(callback: CallbackQuery):
+    logging.warning("Unhandled callback data: %r", callback.data)
+    await callback.answer("Кнопка устарела. Нажмите /start", show_alert=True)
 
 
 @router.message(SearchState.entering_number)
@@ -223,7 +229,13 @@ async def process(message, state, task):
             try: await message.answer_photo(image)
             except Exception: logging.warning("image send failed: %s", image)
     except Exception as error:
-        await message.answer(f"Не удалось загрузить решение: {error}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Открыть на Reshak.ru", url=book.url(task))]]))
+        await message.answer(
+            "Невозможно получить информацию по этому заданию. "
+            "Попробуйте еще раз позже или откройте решение на Reshak.ru.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Открыть на Reshak.ru", url=book.url(task))
+            ]]),
+        )
     await state.clear()
 
 
