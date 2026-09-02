@@ -11,6 +11,7 @@ from urllib.parse import urljoin
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -24,11 +25,19 @@ import matplotlib.pyplot as plt
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 router = Router()
+ACCESS_CODE = os.getenv("ACCESS_CODE", "101010ajk")
 AI_MODELS = {
     "minimax-m3": "MiniMax M3",
     "gemma-4-31b": "Gemma 4 31B",
     "ag/gemini-3.7-flash-high": "Gemini 3.7 Flash High",
 }
+VISION_MODEL = os.getenv("ANYMODEL_VISION_MODEL", "ag/gemini-3.7-flash-high")
+TRANSCRIBE_MODELS = (
+    os.getenv("ANYMODEL_TRANSCRIBE_MODEL", "dg/whisper-large"),
+    "dg/nova-3",
+    "dg/nova-2",
+    "am/nemotron-3-nano-omni-30b-a3b-reasoning-stt",
+)
 AI_HISTORY: dict[int, list[dict[str, str]]] = {}
 
 
@@ -67,6 +76,7 @@ class Cache:
         self.ttl = int(os.getenv("CACHE_TTL_HOURS", "6")) * 3600
         with sqlite3.connect(self.path) as db:
             db.execute("CREATE TABLE IF NOT EXISTS answers (key TEXT PRIMARY KEY, title TEXT, task TEXT, images TEXT, url TEXT, created INTEGER)")
+            db.execute("CREATE TABLE IF NOT EXISTS authorized_users (user_id INTEGER PRIMARY KEY, authorized_at INTEGER NOT NULL)")
             columns = {row[1] for row in db.execute("PRAGMA table_info(answers)")}
             old_columns = {"cache_key", "task_text", "image_urls", "source_url", "created_at"}
             if old_columns.issubset(columns):
@@ -95,6 +105,14 @@ class Cache:
         with sqlite3.connect(self.path) as db:
             title, task, images, url = value
             db.execute("INSERT OR REPLACE INTO answers VALUES (?, ?, ?, ?, ?, ?)", (key, title, task, "\n".join(images), url, int(time.time())))
+
+    def is_authorized(self, user_id: int) -> bool:
+        with sqlite3.connect(self.path) as db:
+            return db.execute("SELECT 1 FROM authorized_users WHERE user_id=?", (user_id,)).fetchone() is not None
+
+    def authorize(self, user_id: int) -> None:
+        with sqlite3.connect(self.path) as db:
+            db.execute("INSERT OR IGNORE INTO authorized_users VALUES (?, ?)", (user_id, int(time.time())))
 
 
 async def fetch(book, task, session):
@@ -148,6 +166,33 @@ class SearchState(StatesGroup):
 
 
 cache = Cache()
+
+
+class AccessMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user and cache.is_authorized(user.id):
+            return await handler(event, data)
+
+        if isinstance(event, Message):
+            text = (event.text or "").strip()
+            if text == ACCESS_CODE:
+                cache.authorize(event.from_user.id)
+                await event.answer("Код принят. Доступ открыт. Нажмите /start.")
+                return
+            if text.startswith("/start"):
+                await event.answer("Для входа в бота отправьте код доступа сообщением.")
+                return
+            await event.answer("Доступ закрыт. Отправьте код доступа сообщением.")
+            return
+
+        if isinstance(event, CallbackQuery):
+            await event.answer("Сначала введите код доступа.", show_alert=True)
+            return
+
+
+router.message.outer_middleware(AccessMiddleware())
+router.callback_query.outer_middleware(AccessMiddleware())
 
 
 @router.message(CommandStart())
@@ -321,33 +366,38 @@ async def anymodel_request(payload, model: str, endpoint: str = "chat/completion
 
 async def transcribe_voice(file_bytes: bytes, filename: str = "voice.ogg") -> str:
     api_key = os.getenv("ANYMODEL_API_KEY", "").strip()
-    model = os.getenv(
-        "ANYMODEL_TRANSCRIBE_MODEL",
-        "am/nemotron-3-nano-omni-30b-a3b-reasoning-stt",
-    ).strip()
     if not api_key:
         raise RuntimeError("ИИ-провайдер не настроен")
-    form = aiohttp.FormData()
-    form.add_field("file", file_bytes, filename=filename, content_type="audio/ogg")
-    form.add_field("model", model)
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://anymodel.org/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                data=form,
-                timeout=aiohttp.ClientTimeout(total=90),
-            ) as response:
-                data = await response.json(content_type=None)
-                if response.status != 200:
-                    logging.warning("Transcription error %s: %s", response.status, data)
-                    raise RuntimeError("не удалось распознать голос")
-    except (aiohttp.ClientError, asyncio.TimeoutError) as error:
-        raise RuntimeError("сервис транскрибации временно недоступен") from error
-    text = data.get("text", "").strip()
-    if not text:
-        raise RuntimeError("в голосовом сообщении не найден текст")
-    return text
+    last_error = None
+    for model in dict.fromkeys(TRANSCRIBE_MODELS):
+        for attempt in range(2):
+            form = aiohttp.FormData()
+            form.add_field("file", file_bytes, filename=filename, content_type="audio/ogg")
+            form.add_field("model", model)
+            form.add_field("language", "ru")
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        "https://anymodel.org/v1/audio/transcriptions",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        data=form,
+                        timeout=aiohttp.ClientTimeout(total=90),
+                    ) as response:
+                        data = await response.json(content_type=None)
+                        if response.status == 200:
+                            text = data.get("text", "").strip()
+                            if text:
+                                return text
+                        last_error = f"{response.status}: {data}"
+                        logging.warning("Transcription error with %s, attempt %s: %s", model, attempt + 1, last_error)
+                        if response.status not in (429, 500, 502, 503, 504):
+                            break
+            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+                last_error = str(error)
+                logging.warning("Transcription connection error with %s: %s", model, error)
+            if attempt == 0:
+                await asyncio.sleep(2)
+    raise RuntimeError("сервис транскрибации временно недоступен") from Exception(last_error)
 
 
 async def answer_ai_content(user_id: int, content, model: str) -> str:
